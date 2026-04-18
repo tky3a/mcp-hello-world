@@ -4,73 +4,91 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 
+	"github.com/joho/godotenv"
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
-func main() {
-	// 1. クライアントの作成（NewStdioMCPClient を使用）
-	// server-filesystem は、引数としてアクセスを許可するディレクトリのパスを受け取ります。
-	c, err := client.NewStdioMCPClient(
-		"npx",
-		os.Environ(),
-		"-y", "@modelcontextprotocol/server-filesystem",
-		"/Users/tky/workspace/WebApplication/mcp-hello-world",
-	)
-	if err != nil {
-		log.Fatalf("Failed to create client: %v", err)
+// authTransport はすべてのリクエストに API Key ヘッダーを付与するカスタム RoundTripper です
+type authTransport struct {
+	apiKey string
+	base   http.RoundTripper
+}
+
+func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.Header.Set("Api-Key", t.apiKey)
+	req.Header.Set("include-tags", "discovery,alerting")
+	req.Header.Set("Content-Type", "application/json")
+
+	// リクエスト直前にデバッグログ
+	fmt.Printf("Connecting to: %s with header Api-Key: %s...\n", req.URL, t.apiKey[:10]+"***")
+
+	resp, err := t.base.RoundTrip(req)
+
+	// 403が出た場合に詳細を表示
+	if resp != nil && resp.StatusCode == 403 {
+		fmt.Println("Error: 403 Forbidden. Please check if your User API Key (NRAK-...) is correct and has sufficient permissions.")
 	}
-	defer c.Close()
+	return resp, err
+}
+
+func main() {
+	_ = godotenv.Load()
+	apiKey := os.Getenv("NEW_RELIC_API_KEY")
+	if apiKey == "" {
+		log.Fatal("NEW_RELIC_API_KEY is not set")
+	}
 
 	ctx := context.Background()
 
-	// 3. 初期化（Initialize）の実行
+	// 1. カスタム HTTP クライアントの作成
+	// これにより、SSE の接続確立時やその後の通信すべてに API キーが乗ります
+	httpClient := &http.Client{
+		Transport: &authTransport{
+			apiKey: apiKey,
+			base:   http.DefaultTransport,
+		},
+	}
+
+	endpoint := "https://mcp.newrelic.com/mcp/"
+
+	// 2. HTTP クライアントを渡して SSE クライアントを生成
+	c, err := client.NewSSEMCPClient(
+		endpoint,
+		client.WithHTTPClient(httpClient), // ここで作成したクライアントを渡す
+	)
+	if err != nil {
+		log.Fatalf("Failed to create SSE client: %v", err)
+	}
+	defer c.Close()
+
+	// --- ここが重要！ ---
+	// SSEの場合は、Initializeの前にStartを呼んで接続を確立させる必要があります
+	if err := c.Start(ctx); err != nil {
+		log.Fatalf("Failed to start transport: %v", err)
+	}
+	// -------------------
+
+	// 3. 初期化
 	initRequest := mcp.InitializeRequest{
 		Params: mcp.InitializeParams{
 			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
 			Capabilities:    mcp.ClientCapabilities{},
 			ClientInfo: mcp.Implementation{
-				Name:    "my-go-client",
+				Name:    "my-go-mcp-hub",
 				Version: "1.0.0",
 			},
 		},
 	}
 
+	// 認証が通っていれば、ここで成功します
 	_, err = c.Initialize(ctx, initRequest)
 	if err != nil {
 		log.Fatalf("Initialize error: %v", err)
 	}
 
-	fmt.Println("MCP Client Initialized successfully!")
-
-	// 4. 利用可能なツール一覧を取得して表示
-	tools, err := c.ListTools(ctx, mcp.ListToolsRequest{})
-	if err != nil {
-		log.Fatalf("ListTools error: %v", err)
-	}
-
-	fmt.Println("\n--- Available Tools ---")
-	for _, t := range tools.Tools {
-		fmt.Printf("- %s: %s\n", t.Name, t.Description)
-	}
-
-	// 5. 特定のツールを実行（read_file）
-	fmt.Println("\n--- Executing Tool: read_file ---")
-	result, err := c.CallTool(ctx, mcp.CallToolRequest{
-		Params: mcp.CallToolParams{
-			Name: "read_file",
-			Arguments: map[string]any{
-				"path": "/Users/tky/workspace/WebApplication/mcp-hello-world/test_memo.txt",
-			},
-		},
-	})
-
-	if err != nil {
-		log.Fatalf("CallTool error: %v", err)
-	}
-
-	fmt.Printf("Result: %v\n", result.Content)
-
+	fmt.Println("Successfully connected to New Relic MCP via SSE!")
 }
