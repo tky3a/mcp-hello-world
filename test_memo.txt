@@ -1,0 +1,2 @@
+Hello from MCP FileSystem Server!
+This is a test file for read_file tool.
